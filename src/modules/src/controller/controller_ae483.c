@@ -65,6 +65,33 @@ static float e_x = 0.0f;    // integrated error in p_x
 static float e_y = 0.0f;    // integrated error in p_y
 static float e_z = 0.0f;    // integrated error in p_z
 
+// Measured attitude quaternion (body-to-world), from the onboard estimator
+static float qw = 1.0f;
+static float qx = 0.0f;
+static float qy = 0.0f;
+static float qz = 0.0f;
+
+//   J * dw/dt = tau - w x (J w)        (rigid-body rotational dynamics)
+//   dq/dt     = 0.5 * q (x) [0, w]     (quaternion kinematics)
+// driven by the torques the PID commanded
+static bool  pred_valid = false;
+static float qw_pred = 1.0f;
+static float qx_pred = 0.0f;
+static float qy_pred = 0.0f;
+static float qz_pred = 0.0f;
+static float w_x_pred = 0.0f;
+static float w_y_pred = 0.0f;
+static float w_z_pred = 0.0f;
+
+// Residuals near zero for healthy motors;
+// a weak motor shows up as a residual that stays large or keeps growing.
+static float r_att_x = 0.0f;      // attitude residual, rad (small-angle, body x)
+static float r_att_y = 0.0f;      // attitude residual, rad (small-angle, body y)
+static float r_att_z = 0.0f;      // attitude residual, rad (small-angle, body z)
+static float r_w_x = 0.0f;        // angular velocity residual, rad/s
+static float r_w_y = 0.0f;
+static float r_w_z = 0.0f;
+
 // Gains (these are set by flight.py - do not edit the values here)
 static float eq_tau_x_cmd = 0.0f;
 static float k_tau_x_cmd_p_y = 0.0f;
@@ -193,6 +220,27 @@ void controllerAE483(control_t *control,
   w_y = radians(sensors->gyro.y);
   w_z = radians(sensors->gyro.z);
 
+    // Get the measured attitude quaternion (already provided by the estimator)
+  qw = state->attitudeQuaternion.w;
+  qx = state->attitudeQuaternion.x;
+  qy = state->attitudeQuaternion.y;
+  qz = state->attitudeQuaternion.z;
+
+  // Compare against what the model predicted
+  if (pred_valid) {
+  // Error, q_err = conj(q_pred) (x) q_meas - (rotation from predicted to measured, body frame)
+    float e_w  =  qw_pred*qw + qx_pred*qx + qy_pred*qy + qz_pred*qz;
+    float e_vx =  qw_pred*qx - qw*qx_pred - (qy_pred*qz - qz_pred*qy);
+    float e_vy =  qw_pred*qy - qw*qy_pred - (qz_pred*qx - qx_pred*qz);
+    float e_vz =  qw_pred*qz - qw*qz_pred - (qx_pred*qy - qy_pred*qx);
+    float s = (e_w < 0.0f) ? -2.0f : 2.0f;   // 2*vec ~ rotation angle
+    r_att_x = s * e_vx;
+    r_att_y = s * e_vy;
+    r_att_z = s * e_vz;
+    r_w_x = w_x - w_x_pred;
+    r_w_y = w_y - w_y_pred;
+    r_w_z = w_z - w_z_pred;
+  }
     // Estimate tau_x and tau_y by finite difference
   tau_x = J_x * (w_x - w_x_old) / dt;
   tau_y = J_y * (w_y - w_y_old) / dt;
@@ -217,6 +265,11 @@ void controllerAE483(control_t *control,
     e_y = 0.0f;
     e_z = 0.0f;
 
+    // Not flying: no model prediction, zero residuals
+    pred_valid = false;
+    r_att_x = 0.0f; r_att_y = 0.0f; r_att_z = 0.0f;
+    r_w_x = 0.0f;   r_w_y = 0.0f;   r_w_z = 0.0f;
+
   } else {
     // Otherwise, motor power commands should be
     // chosen by the controller
@@ -231,6 +284,34 @@ void controllerAE483(control_t *control,
     e_x += dt * (p_x - p_x_des);
     e_y += dt * (p_y - p_y_des);
     e_z += dt * (p_z - p_z_des);
+
+    // Use the torques from PID(what the motors should produce)
+    if (J_z > 0.0f) {
+      // Rotational dynamics (Euler's): J dw/dt = tau - w x (J w)
+      float wdot_x = (tau_x_cmd - (J_z - J_y) * w_y * w_z) / J_x;
+      float wdot_y = (tau_y_cmd - (J_x - J_z) * w_z * w_x) / J_y;
+      float wdot_z = (tau_z     - (J_y - J_x) * w_x * w_y) / J_z;
+      w_x_pred = w_x + dt * wdot_x;
+      w_y_pred = w_y + dt * wdot_y;
+      w_z_pred = w_z + dt * wdot_z;
+
+      // Quaternion kinematics: dq/dt = 0.5 * q (x) [0, w]
+      float qw_dot = 0.5f * (-qx * w_x - qy * w_y - qz * w_z);
+      float qx_dot = 0.5f * ( qw * w_x + qy * w_z - qz * w_y);
+      float qy_dot = 0.5f * ( qw * w_y - qx * w_z + qz * w_x);
+      float qz_dot = 0.5f * ( qw * w_z + qx * w_y - qy * w_x);
+      qw_pred = qw + dt * qw_dot;
+      qx_pred = qx + dt * qx_dot;
+      qy_pred = qy + dt * qy_dot;
+      qz_pred = qz + dt * qz_dot;
+
+      // Re-normalize
+      float n = sqrtf(qw_pred*qw_pred + qx_pred*qx_pred + qy_pred*qy_pred + qz_pred*qz_pred);
+      if (n > 1e-6f) {
+        qw_pred /= n; qx_pred /= n; qy_pred /= n; qz_pred /= n;
+      }
+      pred_valid = true;
+    }
 
     // FIXME (METHOD OF POWER DISTRIBUTION GOES HERE)
     m_1 = limitUint16( -5162622.6f * tau_x_cmd -5162622.6f * tau_y_cmd -50100200.4f * tau_z + 167785.2f * f_z );
@@ -293,6 +374,22 @@ LOG_ADD(LOG_FLOAT,       tau_y_cmd,              &tau_y_cmd)
 LOG_ADD(LOG_FLOAT,             e_x,                    &e_x)
 LOG_ADD(LOG_FLOAT,             e_y,                    &e_y)
 LOG_ADD(LOG_FLOAT,             e_z,                    &e_z)
+
+// Quaternion model
+LOG_ADD(LOG_FLOAT,       qw,                     &qw)
+LOG_ADD(LOG_FLOAT,       qx,                     &qx)
+LOG_ADD(LOG_FLOAT,       qy,                     &qy)
+LOG_ADD(LOG_FLOAT,       qz,                     &qz)
+LOG_ADD(LOG_FLOAT,       qw_pred,                &qw_pred)
+LOG_ADD(LOG_FLOAT,       qx_pred,                &qx_pred)
+LOG_ADD(LOG_FLOAT,       qy_pred,                &qy_pred)
+LOG_ADD(LOG_FLOAT,       qz_pred,                &qz_pred)
+LOG_ADD(LOG_FLOAT,       r_att_x,                &r_att_x)
+LOG_ADD(LOG_FLOAT,       r_att_y,                &r_att_y)
+LOG_ADD(LOG_FLOAT,       r_att_z,                &r_att_z)
+LOG_ADD(LOG_FLOAT,       r_w_x,                  &r_w_x)
+LOG_ADD(LOG_FLOAT,       r_w_y,                  &r_w_y)
+LOG_ADD(LOG_FLOAT,       r_w_z,                  &r_w_z)
 
 LOG_GROUP_STOP(ae483log)
 
